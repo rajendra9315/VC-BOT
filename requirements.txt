@@ -1,8 +1,21 @@
-fastapi==0.109.2
-uvicorn[standard]==0.27.1
+# ── PINNED VERSIONS — DO NOT CHANGE unless you know what you're doing ──────────
+# pytgcalls 3.x broke the API completely. 0.9.x is stable for Pyrogram userbots.
+# Pyrogram 2.0.x is required by pytgcalls 0.9.x.
+
+Pyrogram==2.0.106
+TgCrypto==1.2.5
+
+# pytgcalls: pinned to last stable 0.9.x build
+# DO NOT upgrade to 3.x — completely different API
+py-tgcalls==0.9.39
+
+# Web server
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+
+# Utils
 python-dotenv==1.0.0
-telethon==1.34.0
-pyrogram==2.0.106
-tgcaller==1.0.0
-qrcode==7.4.2
-pillow==10.2.0
+
+# Audio streaming (pytgcalls uses ffmpeg under the hood — install ffmpeg separately)
+# On Ubuntu/Debian VPS:  sudo apt install -y ffmpeg
