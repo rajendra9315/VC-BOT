@@ -7,12 +7,18 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from dotenv import load_dotenv
 
+# Telethon for message reposting (preserves formatting, media, premium emojis)
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError
-from pytgcalls import PyTgCalls, StreamType
-from pytgcalls.types.input_stream import AudioPiped
+
+# Pyrogram + PyTgCalls for reliable voice chat
+from pyrogram import Client as PyroClient
+from pyrogram.errors import SessionPasswordNeeded as PyroPasswordNeeded
+from pytgcalls import PyTgCalls
+from pytgcalls.types import AudioPiped
 from pytgcalls.exceptions import NoActiveGroupCall, AlreadyJoinedError, NotInGroupCallError
+
 import qrcode
 
 load_dotenv()
@@ -30,11 +36,13 @@ ADMIN_PASS = os.getenv("ADMIN_PASSWORD", "admin")
 
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
-SESSION_FILE = "telethon.session"
+TELE_SESSION_FILE = "telethon.session"
+PYRO_SESSION_FILE = "pyrogram.session"
 
 # ---------- GLOBAL STATE ----------
-telethon_client: TelegramClient = None
-pytgcalls_app: PyTgCalls = None
+tele_client: TelegramClient = None
+pyro_client: PyroClient = None
+pytgcalls: PyTgCalls = None
 playlist: list[str] = []          # file paths
 current_index = 0
 is_playing = False
@@ -43,57 +51,116 @@ login_state = {"status": "disconnected", "qr_data": None}
 # ---------- FASTAPI APP ----------
 app = FastAPI()
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# ---------- TELEGRAM CLIENT ----------
-async def get_telethon_client():
-    global telethon_client
-    if telethon_client is None:
+# ---------- TELEGRAM CLIENT (Telethon) ----------
+async def get_tele_client():
+    global tele_client
+    if tele_client is None:
         session_str = None
-        if os.path.exists(SESSION_FILE):
-            with open(SESSION_FILE, "r") as f:
+        if os.path.exists(TELE_SESSION_FILE):
+            with open(TELE_SESSION_FILE, "r") as f:
                 session_str = f.read()
-        telethon_client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-        await telethon_client.connect()
-    return telethon_client
+        tele_client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+        await tele_client.connect()
+    return tele_client
 
-async def save_session():
-    if telethon_client:
-        session_str = telethon_client.session.save()
-        with open(SESSION_FILE, "w") as f:
+async def save_tele_session():
+    if tele_client:
+        session_str = tele_client.session.save()
+        with open(TELE_SESSION_FILE, "w") as f:
             f.write(session_str)
 
-async def complete_login(code: str):
+async def complete_tele_login(code: str = None, password: str = None):
     global login_state
-    client = await get_telethon_client()
+    client = await get_tele_client()
     try:
-        await client.sign_in(PHONE, code)
+        if code:
+            await client.sign_in(PHONE, code)
+        elif password:
+            await client.sign_in(password=password)
+        else:
+            return {"error": "Missing credentials"}
         login_state["status"] = "logged_in"
-        await save_session()
+        await save_tele_session()
+        # Also try to init Pyrogram after Telethon is logged in
+        await init_pyrogram()
         return {"status": "success"}
     except SessionPasswordNeededError:
-        if TWO_STEP_PASSWORD:
-            await client.sign_in(password=TWO_STEP_PASSWORD)
-            login_state["status"] = "logged_in"
-            await save_session()
-            return {"status": "success"}
-        else:
-            login_state["status"] = "wait_password"
-            return {"status": "2fa_needed"}
+        login_state["status"] = "wait_password"
+        return {"status": "2fa_needed"}
     except Exception as e:
         login_state["status"] = "error"
         return {"error": str(e)}
 
-# ---------- PYTGCALLS ----------
-async def start_pytgcalls():
-    global pytgcalls_app
-    if pytgcalls_app is not None:
+# ---------- PYROGRAM + PyTgCalls ----------
+async def init_pyrogram():
+    global pyro_client, pytgcalls
+    if pyro_client is not None:
         return
-    client = await get_telethon_client()
-    pytgcalls_app = PyTgCalls(client)
-    await pytgcalls_app.start()
-    @pytgcalls_app.on_stream_end()
-    async def on_stream_end(_, update):
+    # Load existing session or create new
+    session_str = None
+    if os.path.exists(PYRO_SESSION_FILE):
+        with open(PYRO_SESSION_FILE, "r") as f:
+            session_str = f.read()
+    pyro_client = PyroClient(
+        "voice_bot",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        session_string=session_str,
+        in_memory=False
+    )
+    await pyro_client.start()
+    # If not authorized, try to sign in using same phone & 2FA
+    if not await pyro_client.is_user_authorized():
+        try:
+            await pyro_client.send_code(PHONE)
+            # We can't ask for code here – will be handled via API endpoint
+            raise Exception("Pyrogram not authorized. Use /api/pyro_login first.")
+        except Exception as e:
+            # If we have 2FA password in env, try directly
+            if TWO_STEP_PASSWORD:
+                try:
+                    await pyro_client.sign_in(PHONE, code=input("Pyrogram code? "))
+                except:
+                    pass
+            raise
+    # Save session string for next run
+    session_str = await pyro_client.export_session_string()
+    with open(PYRO_SESSION_FILE, "w") as f:
+        f.write(session_str)
+    # Initialize PyTgCalls
+    pytgcalls = PyTgCalls(pyro_client)
+    await pytgcalls.start()
+    @pytgcalls.on_stream_end()
+    async def on_stream_end(_, __):
         await play_next()
+
+async def start_voice_chat():
+    global is_playing, current_index
+    if not playlist:
+        raise Exception("No audio files uploaded")
+    await init_pyrogram()
+    try:
+        await pytgcalls.join_group_call(CHANNEL_ID, AudioPiped(playlist[0]))
+        is_playing = True
+        current_index = 1
+    except AlreadyJoinedError:
+        is_playing = True
+        current_index = 0
+        await play_next()
+    except Exception as e:
+        raise e
+
+async def stop_voice_chat():
+    global is_playing
+    try:
+        await pytgcalls.leave_group_call(CHANNEL_ID)
+        is_playing = False
+    except NotInGroupCallError:
+        is_playing = False
+    except Exception as e:
+        raise e
 
 async def play_next():
     global current_index, is_playing, playlist
@@ -103,7 +170,7 @@ async def play_next():
         current_index = 0
     file_path = playlist[current_index]
     try:
-        await pytgcalls_app.change_stream(CHANNEL_ID, AudioPiped(file_path))
+        await pytgcalls.change_stream(CHANNEL_ID, AudioPiped(file_path))
         current_index += 1
     except Exception as e:
         print(f"Stream error: {e}")
@@ -117,26 +184,28 @@ async def api_login(username: str = Form(...), password: str = Form(...)):
 
 @app.get("/api/status")
 async def api_status():
-    client = await get_telethon_client()
-    auth = await client.is_user_authorized()
+    tele = await get_tele_client()
+    auth = await tele.is_user_authorized()
+    pyro_ok = pyro_client is not None and await pyro_client.is_user_authorized()
     return {
         "authorized": auth,
+        "pyro_authorized": pyro_ok,
         "login_state": login_state["status"],
         "qr_data": login_state.get("qr_data"),
         "vc_active": is_playing,
-        "playlist": [p.name for p in playlist],
-        "current_track": playlist[current_index-1].name if is_playing and current_index>0 else None
+        "playlist": [Path(p).name for p in playlist],
+        "current_track": Path(playlist[current_index-1]).name if is_playing and current_index>0 else None
     }
 
 @app.post("/api/send_code")
 async def api_send_code():
     global login_state
-    client = await get_telethon_client()
+    client = await get_tele_client()
     if PHONE:
         try:
             await client.send_code_request(PHONE)
             login_state["status"] = "wait_code"
-            await save_session()
+            await save_tele_session()
             return {"status": "code_sent"}
         except Exception as e:
             login_state["status"] = "error"
@@ -154,56 +223,54 @@ async def api_send_code():
 
 @app.post("/api/submit_code")
 async def submit_code(code: str = Form(...)):
-    return await complete_login(code)
+    return await complete_tele_login(code=code)
 
 @app.post("/api/submit_password")
 async def submit_password(password: str = Form(...)):
-    global login_state
-    client = await get_telethon_client()
+    return await complete_tele_login(password=password)
+
+@app.post("/api/pyro_login")
+async def pyro_login_step(code: str = Form(None), password: str = Form(None)):
+    """Manually login Pyrogram if not already authorized."""
+    global pyro_client
     try:
-        await client.sign_in(password=password)
-        login_state["status"] = "logged_in"
-        await save_session()
+        if code:
+            await pyro_client.sign_in(PHONE, code=code)
+        elif password:
+            await pyro_client.sign_in(password=password)
+        else:
+            await pyro_client.send_code(PHONE)
+            return {"status": "code_sent"}
+        # save session
+        session_str = await pyro_client.export_session_string()
+        with open(PYRO_SESSION_FILE, "w") as f:
+            f.write(session_str)
         return {"status": "success"}
+    except PyroPasswordNeeded:
+        return {"status": "2fa_needed"}
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
 @app.post("/api/start_vc")
 async def start_vc():
-    global is_playing, current_index
-    if not playlist:
-        raise HTTPException(400, "No audio files uploaded")
-    await start_pytgcalls()
     try:
-        await pytgcalls_app.join_group_call(CHANNEL_ID, AudioPiped(playlist[0]))
-        is_playing = True
-        current_index = 1
+        await start_voice_chat()
         return {"status": "started"}
-    except AlreadyJoinedError:
-        is_playing = True
-        current_index = 0
-        await play_next()
-        return {"status": "already_joined"}
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
 @app.post("/api/stop_vc")
 async def stop_vc():
-    global is_playing
     try:
-        await pytgcalls_app.leave_group_call(CHANNEL_ID)
-        is_playing = False
+        await stop_voice_chat()
         return {"status": "stopped"}
-    except NotInGroupCallError:
-        is_playing = False
-        return {"status": "not_in_call"}
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(('.mp3', '.ogg')):
-        raise HTTPException(400, "Only MP3/OGG allowed")
+    if not file.filename.lower().endswith(('.mp3', '.ogg', '.m4a')):
+        raise HTTPException(400, "Only MP3/OGG/M4A allowed")
     file_path = UPLOAD_DIR / file.filename
     with open(file_path, "wb") as f:
         f.write(await file.read())
@@ -233,12 +300,11 @@ async def delete_file(filename: str):
 
 @app.post("/api/post_from_source")
 async def post_from_source(message_id: int = Form(...)):
-    client = await get_telethon_client()
+    client = await get_tele_client()
     try:
         msg = await client.get_messages(SOURCE_CHANNEL_ID, ids=message_id)
         if not msg:
             raise HTTPException(404, "Message not found")
-        # Repost preserving everything (premium emojis, media, formatting)
         await client.send_message(
             CHANNEL_ID,
             message=msg.text,
@@ -252,11 +318,10 @@ async def post_from_source(message_id: int = Form(...)):
 
 @app.post("/api/post_custom")
 async def post_custom(text: str = Form(""), file: UploadFile = File(None)):
-    client = await get_telethon_client()
+    client = await get_tele_client()
     try:
         media = None
         if file:
-            # Save temp file
             tmp_path = UPLOAD_DIR / f"temp_{file.filename}"
             with open(tmp_path, "wb") as f:
                 f.write(await file.read())
@@ -268,7 +333,7 @@ async def post_custom(text: str = Form(""), file: UploadFile = File(None)):
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
-# ---------- EMBEDDED WEB UI ----------
+# ---------- EMBEDDED UI (same as original, plus Pyrogram login if needed) ----------
 HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -318,7 +383,8 @@ button:hover{transform:scale(1.02);opacity:0.9}
 
   <div id="tab-vc">
     <div style="margin:1.5rem 0;padding:1rem;background:rgba(255,255,255,0.04);border-radius:16px">
-      <p>Bot: <span id="botStatus">Checking...</span></p>
+      <p>Telethon Bot: <span id="botStatus">Checking...</span></p>
+      <p>Pyrogram (VC): <span id="pyroStatus">Unknown</span></p>
       <p>VC: <span id="vcStatus">Stopped</span></p>
       <p id="currentTrack"></p>
     </div>
@@ -327,7 +393,7 @@ button:hover{transform:scale(1.02);opacity:0.9}
       <button onclick="stopVC()" style="background:linear-gradient(135deg,#ff416c,#ff4b2b)">⏹️ Stop VC</button>
     </div>
     <div id="loginSection" class="hidden" style="margin-top:2rem">
-      <h3>Telegram Login</h3>
+      <h3>Telegram Login (Telethon)</h3>
       <button onclick="sendCode()">📱 Send Code / QR</button>
       <div id="qrContainer" class="hidden"><img id="qrImage" class="qr-image"><p>Scan with Telegram</p></div>
       <div id="codeContainer" class="hidden">
@@ -339,14 +405,26 @@ button:hover{transform:scale(1.02);opacity:0.9}
         <button onclick="submitPassword()">Verify</button>
       </div>
     </div>
+    <div id="pyroSection" style="margin-top:2rem">
+      <h3>Pyrogram Voice Login (if needed)</h3>
+      <button onclick="pyroSendCode()">📱 Init Pyrogram</button>
+      <div id="pyroCodeContainer" class="hidden">
+        <input id="pyroCodeInput" placeholder="Enter code">
+        <button onclick="pyroSubmitCode()">Verify Pyrogram</button>
+      </div>
+      <div id="pyroPasswordContainer" class="hidden">
+        <input type="password" id="pyroPassword2FA" placeholder="2FA for Pyrogram">
+        <button onclick="pyroSubmitPassword()">Verify 2FA</button>
+      </div>
+    </div>
   </div>
 
   <div id="tab-sounds" class="hidden">
     <h3>Upload Audio Files</h3>
     <div class="upload-zone" id="dropZone">
-      <p>Drop MP3/OGG files here</p>
+      <p>Drop MP3/OGG/M4A files here</p>
       <label for="fileInput" class="file-label" style="display:block;text-align:center;background:#7f00ff;border:none;margin-top:1rem">Browse</label>
-      <input type="file" id="fileInput" multiple accept=".mp3,.ogg" style="display:none">
+      <input type="file" id="fileInput" multiple accept=".mp3,.ogg,.m4a" style="display:none">
     </div>
     <div id="playlistContainer"></div>
   </div>
@@ -364,7 +442,7 @@ button:hover{transform:scale(1.02);opacity:0.9}
 </div>
 
 <script>
-// Particles
+// Particles effect (same as before)
 const canvas=document.getElementById('particles');
 const ctx=canvas.getContext('2d');
 canvas.width=innerWidth;canvas.height=innerHeight;
@@ -385,13 +463,14 @@ function switchTab(tab){
 async function login(){
   let u=document.getElementById('username').value,p=document.getElementById('password').value;
   let r=await fetch('/api/login',{method:'POST',body:new URLSearchParams({username:u,password:p})});
-  if(r.ok){document.getElementById('loginPage').classList.add('hidden');document.getElementById('dashboard').classList.remove('hidden');loadStatus();setInterval(loadStatus,5000)}
+  if(r.ok){localStorage.setItem('logged','1');document.getElementById('loginPage').classList.add('hidden');document.getElementById('dashboard').classList.remove('hidden');loadStatus();setInterval(loadStatus,5000)}
   else document.getElementById('loginError').textContent='Invalid credentials';
 }
 
 async function loadStatus(){
   let r=await fetch('/api/status'),d=await r.json();
   document.getElementById('botStatus').textContent=d.authorized?'Connected ✅':'Disconnected ❌';
+  document.getElementById('pyroStatus').textContent=d.pyro_authorized?'Ready ✅':'Not logged in';
   document.getElementById('vcStatus').textContent=d.vc_active?'Playing 🔊':'Stopped';
   document.getElementById('currentTrack').textContent=d.current_track?'Now: '+d.current_track:'';
   if(!d.authorized)document.getElementById('loginSection').classList.remove('hidden');
@@ -421,7 +500,6 @@ async function submitPassword(){
   let r=await fetch('/api/submit_password',{method:'POST',body:new URLSearchParams({password:p})});
   if(r.ok){toast('2FA verified');loadStatus()}
 }
-
 async function startVC(){
   let r=await fetch('/api/start_vc',{method:'POST'});
   if(r.ok)toast('VC started');else{let e=await r.json();toast('Error: '+e.error)}
@@ -432,8 +510,26 @@ async function stopVC(){
   if(r.ok)toast('VC stopped');
   loadStatus();
 }
-
-// File uploads
+// Pyrogram login steps
+async function pyroSendCode(){
+  let r=await fetch('/api/pyro_login',{method:'POST'});
+  let d=await r.json();
+  if(d.status=='code_sent') document.getElementById('pyroCodeContainer').classList.remove('hidden');
+  else toast('Error: '+d.error);
+}
+async function pyroSubmitCode(){
+  let code=document.getElementById('pyroCodeInput').value;
+  let r=await fetch('/api/pyro_login',{method:'POST',body:new URLSearchParams({code})});
+  let d=await r.json();
+  if(d.status=='2fa_needed') document.getElementById('pyroPasswordContainer').classList.remove('hidden');
+  else if(r.ok){toast('Pyrogram ready');loadStatus();}
+}
+async function pyroSubmitPassword(){
+  let p=document.getElementById('pyroPassword2FA').value;
+  let r=await fetch('/api/pyro_login',{method:'POST',body:new URLSearchParams({password:p})});
+  if(r.ok){toast('Pyrogram ready');loadStatus();}
+}
+// Uploads
 let dz=document.getElementById('dropZone');
 dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('dragover')});
 dz.addEventListener('dragleave',()=>dz.classList.remove('dragover'));
@@ -444,7 +540,6 @@ async function upload(file){
   let r=await fetch('/api/upload',{method:'POST',body:fd});
   if(r.ok){toast('Uploaded: '+file.name);loadStatus()}else toast('Upload failed');
 }
-
 // Message reposting
 async function postFromSource(){
   let id=document.getElementById('sourceMsgId').value;
@@ -460,11 +555,6 @@ async function postCustom(){
 }
 
 window.onload=()=>{if(localStorage.getItem('logged')){document.getElementById('loginPage').classList.add('hidden');document.getElementById('dashboard').classList.remove('hidden');loadStatus();setInterval(loadStatus,5000)}}
-login=async function(){let u=document.getElementById('username').value,p=document.getElementById('password').value;
-  let r=await fetch('/api/login',{method:'POST',body:new URLSearchParams({username:u,password:p})});
-  if(r.ok){localStorage.setItem('logged','1');document.getElementById('loginPage').classList.add('hidden');document.getElementById('dashboard').classList.remove('hidden');loadStatus();setInterval(loadStatus,5000)}
-  else document.getElementById('loginError').textContent='Invalid credentials';
-}
 </script>
 </body>
 </html>
@@ -477,12 +567,13 @@ async def root():
 # ---------- STARTUP ----------
 @app.on_event("startup")
 async def startup():
-    await get_telethon_client()
-    if await telethon_client.is_user_authorized():
+    await get_tele_client()
+    if await tele_client.is_user_authorized():
         login_state["status"] = "logged_in"
-        await start_pytgcalls()
+        await init_pyrogram()
 
 def run():
     uvicorn.run(app, host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
+    run()
