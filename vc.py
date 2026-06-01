@@ -7,17 +7,14 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from dotenv import load_dotenv
 
-# Telethon for message reposting (preserves formatting, media, premium emojis)
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError
 
-# Pyrogram + PyTgCalls for reliable voice chat
 from pyrogram import Client as PyroClient
 from pyrogram.errors import SessionPasswordNeeded as PyroPasswordNeeded
-from pytgcalls import PyTgCalls
-from pytgcalls.types import AudioPiped
-from pytgcalls.exceptions import NoActiveGroupCall, AlreadyJoinedError, NotInGroupCallError
+from tgcaller import TgCaller
+from tgcaller.types import AudioConfig
 
 import qrcode
 
@@ -42,8 +39,8 @@ PYRO_SESSION_FILE = "pyrogram.session"
 # ---------- GLOBAL STATE ----------
 tele_client: TelegramClient = None
 pyro_client: PyroClient = None
-pytgcalls: PyTgCalls = None
-playlist: list[str] = []          # file paths
+caller: TgCaller = None
+playlist: list[str] = []
 current_index = 0
 is_playing = False
 login_state = {"status": "disconnected", "qr_data": None}
@@ -53,7 +50,7 @@ app = FastAPI()
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# ---------- TELEGRAM CLIENT (Telethon) ----------
+# ---------- TELEGRAM CLIENT (Telethon for Messaging) ----------
 async def get_tele_client():
     global tele_client
     if tele_client is None:
@@ -83,8 +80,7 @@ async def complete_tele_login(code: str = None, password: str = None):
             return {"error": "Missing credentials"}
         login_state["status"] = "logged_in"
         await save_tele_session()
-        # Also try to init Pyrogram after Telethon is logged in
-        await init_pyrogram()
+        await init_pyrogram_and_caller()
         return {"status": "success"}
     except SessionPasswordNeededError:
         login_state["status"] = "wait_password"
@@ -93,12 +89,11 @@ async def complete_tele_login(code: str = None, password: str = None):
         login_state["status"] = "error"
         return {"error": str(e)}
 
-# ---------- PYROGRAM + PyTgCalls ----------
-async def init_pyrogram():
-    global pyro_client, pytgcalls
+# ---------- PYROGRAM + TgCaller (for Voice) ----------
+async def init_pyrogram_and_caller():
+    global pyro_client, caller
     if pyro_client is not None:
         return
-    # Load existing session or create new
     session_str = None
     if os.path.exists(PYRO_SESSION_FILE):
         with open(PYRO_SESSION_FILE, "r") as f:
@@ -111,56 +106,48 @@ async def init_pyrogram():
         in_memory=False
     )
     await pyro_client.start()
-    # If not authorized, try to sign in using same phone & 2FA
     if not await pyro_client.is_user_authorized():
         try:
             await pyro_client.send_code(PHONE)
-            # We can't ask for code here – will be handled via API endpoint
             raise Exception("Pyrogram not authorized. Use /api/pyro_login first.")
         except Exception as e:
-            # If we have 2FA password in env, try directly
             if TWO_STEP_PASSWORD:
                 try:
                     await pyro_client.sign_in(PHONE, code=input("Pyrogram code? "))
                 except:
                     pass
             raise
-    # Save session string for next run
     session_str = await pyro_client.export_session_string()
     with open(PYRO_SESSION_FILE, "w") as f:
         f.write(session_str)
-    # Initialize PyTgCalls
-    pytgcalls = PyTgCalls(pyro_client)
-    await pytgcalls.start()
-    @pytgcalls.on_stream_end()
-    async def on_stream_end(_, __):
+
+    # Initialize TgCaller
+    caller = TgCaller(pyro_client)
+    await caller.start()
+
+    @caller.on_stream_end
+    async def on_stream_end(client, update):
         await play_next()
 
 async def start_voice_chat():
     global is_playing, current_index
     if not playlist:
         raise Exception("No audio files uploaded")
-    await init_pyrogram()
-    try:
-        await pytgcalls.join_group_call(CHANNEL_ID, AudioPiped(playlist[0]))
-        is_playing = True
-        current_index = 1
-    except AlreadyJoinedError:
-        is_playing = True
-        current_index = 0
-        await play_next()
-    except Exception as e:
-        raise e
+    await init_pyrogram_and_caller()
+    if not caller.is_connected(CHANNEL_ID):
+        await caller.join_call(CHANNEL_ID)
+    await caller.play(CHANNEL_ID, playlist[0])
+    is_playing = True
+    current_index = 1
 
 async def stop_voice_chat():
     global is_playing
     try:
-        await pytgcalls.leave_group_call(CHANNEL_ID)
-        is_playing = False
-    except NotInGroupCallError:
+        await caller.leave_call(CHANNEL_ID)
         is_playing = False
     except Exception as e:
-        raise e
+        print(f"Error leaving call: {e}")
+        is_playing = False
 
 async def play_next():
     global current_index, is_playing, playlist
@@ -170,10 +157,10 @@ async def play_next():
         current_index = 0
     file_path = playlist[current_index]
     try:
-        await pytgcalls.change_stream(CHANNEL_ID, AudioPiped(file_path))
+        await caller.play(CHANNEL_ID, file_path)
         current_index += 1
     except Exception as e:
-        print(f"Stream error: {e}")
+        print(f"Play error: {e}")
 
 # ---------- API ENDPOINTS ----------
 @app.post("/api/login")
@@ -231,8 +218,7 @@ async def submit_password(password: str = Form(...)):
 
 @app.post("/api/pyro_login")
 async def pyro_login_step(code: str = Form(None), password: str = Form(None)):
-    """Manually login Pyrogram if not already authorized."""
-    global pyro_client
+    global pyro_client, caller
     try:
         if code:
             await pyro_client.sign_in(PHONE, code=code)
@@ -241,10 +227,14 @@ async def pyro_login_step(code: str = Form(None), password: str = Form(None)):
         else:
             await pyro_client.send_code(PHONE)
             return {"status": "code_sent"}
-        # save session
         session_str = await pyro_client.export_session_string()
         with open(PYRO_SESSION_FILE, "w") as f:
             f.write(session_str)
+        caller = TgCaller(pyro_client)
+        await caller.start()
+        @caller.on_stream_end
+        async def on_stream_end(client, update):
+            await play_next()
         return {"status": "success"}
     except PyroPasswordNeeded:
         return {"status": "2fa_needed"}
@@ -333,7 +323,7 @@ async def post_custom(text: str = Form(""), file: UploadFile = File(None)):
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
-# ---------- EMBEDDED UI (same as original, plus Pyrogram login if needed) ----------
+# ---------- EMBEDDED WEB UI (Full Admin Panel) ----------
 HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -442,7 +432,7 @@ button:hover{transform:scale(1.02);opacity:0.9}
 </div>
 
 <script>
-// Particles effect (same as before)
+// Particles effect
 const canvas=document.getElementById('particles');
 const ctx=canvas.getContext('2d');
 canvas.width=innerWidth;canvas.height=innerHeight;
@@ -570,7 +560,7 @@ async def startup():
     await get_tele_client()
     if await tele_client.is_user_authorized():
         login_state["status"] = "logged_in"
-        await init_pyrogram()
+        await init_pyrogram_and_caller()
 
 def run():
     uvicorn.run(app, host="0.0.0.0", port=PORT)
