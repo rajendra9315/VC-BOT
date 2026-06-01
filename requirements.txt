@@ -1,5 +1,9 @@
+fastapi==0.109.2
+uvicorn[standard]==0.27.1
+python-dotenv==1.0.0
+telethon==1.34.0
 pyrogram==2.0.106
-tgcrypto
-py-tgcalls
-yt-dlp
-python-dotenv
+pytgcalls==5.0.2
+tgcrypto==1.2.5
+qrcode==7.4.2
+pillow==10.2.0
