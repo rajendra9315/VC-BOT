@@ -1,569 +1,378 @@
-import os, asyncio, json, base64, io, shutil
+import os, asyncio, json, shutil, secrets
 from pathlib import Path
-from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
+from typing import Optional
 from dotenv import load_dotenv
-
-from telethon import TelegramClient, events
-from telethon.sessions import StringSession
-from telethon.errors import SessionPasswordNeededError
-
-from pyrogram import Client as PyroClient
-from pyrogram.errors import SessionPasswordNeeded as PyroPasswordNeeded
-from tgcaller import TgCaller
-from tgcaller.types import AudioConfig
-
-import qrcode
 
 load_dotenv()
 
-# ---------- CONFIG ----------
-PORT = int(os.getenv("PORT", 8000))
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-PHONE = os.getenv("PHONE_NUMBER")
-TWO_STEP_PASSWORD = os.getenv("TWO_STEP_PASSWORD")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
-SOURCE_CHANNEL_ID = int(os.getenv("SOURCE_CHANNEL_ID"))
-ADMIN_USER = os.getenv("ADMIN_USERNAME", "admin")
-ADMIN_PASS = os.getenv("ADMIN_PASSWORD", "admin")
+# ── ENV CONFIG ────────────────────────────────────────────────────────────────
+API_ID       = int(os.environ["API_ID"])
+API_HASH     = os.environ["API_HASH"]
+SESSION      = os.environ["SESSION_STRING"]
+CHANNEL      = os.environ["CHANNEL"]          # @username or -100xxxxxxx
+WEB_PASS     = os.environ["WEB_PASSWORD"]
+WEB_PORT     = int(os.getenv("WEB_PORT", "8000"))
+MAX_VOICES   = int(os.getenv("MAX_VOICES", "100"))
+AUDIO_DIR    = Path(os.getenv("AUDIO_DIR", "audio"))
+AUDIO_DIR.mkdir(exist_ok=True)
 
-UPLOAD_DIR = Path("uploads")
-UPLOAD_DIR.mkdir(exist_ok=True)
-TELE_SESSION_FILE = "telethon.session"
-PYRO_SESSION_FILE = "pyrogram.session"
+# ── IMPORTS ───────────────────────────────────────────────────────────────────
+from pyrogram import Client
+from pyrogram.raw.functions.phone import CreateGroupCall, LeaveGroupCall
+from pyrogram.raw.types import InputGroupCall
+from pytgcalls import PyTgCalls
+from pytgcalls.types import AudioPiped, AudioVideoPiped
+from pytgcalls.types.input_stream import AudioParameters
+from pytgcalls.exceptions import NoActiveGroupCall, AlreadyJoinedError
 
-# ---------- GLOBAL STATE ----------
-tele_client: TelegramClient = None
-pyro_client: PyroClient = None
-caller: TgCaller = None
-playlist: list[str] = []
-current_index = 0
-is_playing = False
-login_state = {"status": "disconnected", "qr_data": None}
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, status
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 
-# ---------- FASTAPI APP ----------
-app = FastAPI()
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+# ── STATE ─────────────────────────────────────────────────────────────────────
+queue: list[str] = []          # ordered list of filenames
+current_index: int = 0
+is_playing: bool = False
+vc_active: bool = False
 
-# ---------- TELEGRAM CLIENT (Telethon for Messaging) ----------
-async def get_tele_client():
-    global tele_client
-    if tele_client is None:
-        session_str = None
-        if os.path.exists(TELE_SESSION_FILE):
-            with open(TELE_SESSION_FILE, "r") as f:
-                session_str = f.read()
-        tele_client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-        await tele_client.connect()
-    return tele_client
+app_client = Client("vc_session", api_id=API_ID, api_hash=API_HASH, session_string=SESSION)
+calls = PyTgCalls(app_client)
 
-async def save_tele_session():
-    if tele_client:
-        session_str = tele_client.session.save()
-        with open(TELE_SESSION_FILE, "w") as f:
-            f.write(session_str)
-
-async def complete_tele_login(code: str = None, password: str = None):
-    global login_state
-    client = await get_tele_client()
-    try:
-        if code:
-            await client.sign_in(PHONE, code)
-        elif password:
-            await client.sign_in(password=password)
-        else:
-            return {"error": "Missing credentials"}
-        login_state["status"] = "logged_in"
-        await save_tele_session()
-        await init_pyrogram_and_caller()
-        return {"status": "success"}
-    except SessionPasswordNeededError:
-        login_state["status"] = "wait_password"
-        return {"status": "2fa_needed"}
-    except Exception as e:
-        login_state["status"] = "error"
-        return {"error": str(e)}
-
-# ---------- PYROGRAM + TgCaller (for Voice) ----------
-async def init_pyrogram_and_caller():
-    global pyro_client, caller
-    if pyro_client is not None:
-        return
-    session_str = None
-    if os.path.exists(PYRO_SESSION_FILE):
-        with open(PYRO_SESSION_FILE, "r") as f:
-            session_str = f.read()
-    pyro_client = PyroClient(
-        "voice_bot",
-        api_id=API_ID,
-        api_hash=API_HASH,
-        session_string=session_str,
-        in_memory=False
-    )
-    await pyro_client.start()
-    if not await pyro_client.is_user_authorized():
-        try:
-            await pyro_client.send_code(PHONE)
-            raise Exception("Pyrogram not authorized. Use /api/pyro_login first.")
-        except Exception as e:
-            if TWO_STEP_PASSWORD:
-                try:
-                    await pyro_client.sign_in(PHONE, code=input("Pyrogram code? "))
-                except:
-                    pass
-            raise
-    session_str = await pyro_client.export_session_string()
-    with open(PYRO_SESSION_FILE, "w") as f:
-        f.write(session_str)
-
-    # Initialize TgCaller
-    caller = TgCaller(pyro_client)
-    await caller.start()
-
-    @caller.on_stream_end
-    async def on_stream_end(client, update):
-        await play_next()
-
-async def start_voice_chat():
-    global is_playing, current_index
-    if not playlist:
-        raise Exception("No audio files uploaded")
-    await init_pyrogram_and_caller()
-    if not caller.is_connected(CHANNEL_ID):
-        await caller.join_call(CHANNEL_ID)
-    await caller.play(CHANNEL_ID, playlist[0])
-    is_playing = True
-    current_index = 1
-
-async def stop_voice_chat():
-    global is_playing
-    try:
-        await caller.leave_call(CHANNEL_ID)
-        is_playing = False
-    except Exception as e:
-        print(f"Error leaving call: {e}")
-        is_playing = False
+# ── HELPERS ───────────────────────────────────────────────────────────────────
+async def get_channel_peer():
+    return await app_client.resolve_peer(CHANNEL)
 
 async def play_next():
-    global current_index, is_playing, playlist
-    if not is_playing or not playlist:
-        return
-    if current_index >= len(playlist):
+    global current_index, is_playing, vc_active
+    if not queue or current_index >= len(queue):
         current_index = 0
-    file_path = playlist[current_index]
-    try:
-        await caller.play(CHANNEL_ID, file_path)
+        is_playing = False
+        return
+    fname = queue[current_index]
+    fpath = AUDIO_DIR / fname
+    if not fpath.exists():
         current_index += 1
-    except Exception as e:
-        print(f"Play error: {e}")
-
-# ---------- API ENDPOINTS ----------
-@app.post("/api/login")
-async def api_login(username: str = Form(...), password: str = Form(...)):
-    if username == ADMIN_USER and password == ADMIN_PASS:
-        return {"success": True}
-    raise HTTPException(401, "Invalid credentials")
-
-@app.get("/api/status")
-async def api_status():
-    tele = await get_tele_client()
-    auth = await tele.is_user_authorized()
-    pyro_ok = pyro_client is not None and await pyro_client.is_user_authorized()
-    return {
-        "authorized": auth,
-        "pyro_authorized": pyro_ok,
-        "login_state": login_state["status"],
-        "qr_data": login_state.get("qr_data"),
-        "vc_active": is_playing,
-        "playlist": [Path(p).name for p in playlist],
-        "current_track": Path(playlist[current_index-1]).name if is_playing and current_index>0 else None
-    }
-
-@app.post("/api/send_code")
-async def api_send_code():
-    global login_state
-    client = await get_tele_client()
-    if PHONE:
-        try:
-            await client.send_code_request(PHONE)
-            login_state["status"] = "wait_code"
-            await save_tele_session()
-            return {"status": "code_sent"}
-        except Exception as e:
-            login_state["status"] = "error"
-            return JSONResponse({"error": str(e)}, status_code=400)
-    else:
-        qr_login = await client.qr_login()
-        img = qrcode.make(qr_login.url)
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        b64 = base64.b64encode(buf.getvalue()).decode()
-        login_state["status"] = "wait_qr"
-        login_state["qr_data"] = f"data:image/png;base64,{b64}"
-        login_state["qr_obj"] = qr_login
-        return {"status": "qr_ready", "qr_image": login_state["qr_data"]}
-
-@app.post("/api/submit_code")
-async def submit_code(code: str = Form(...)):
-    return await complete_tele_login(code=code)
-
-@app.post("/api/submit_password")
-async def submit_password(password: str = Form(...)):
-    return await complete_tele_login(password=password)
-
-@app.post("/api/pyro_login")
-async def pyro_login_step(code: str = Form(None), password: str = Form(None)):
-    global pyro_client, caller
+        await play_next()
+        return
     try:
-        if code:
-            await pyro_client.sign_in(PHONE, code=code)
-        elif password:
-            await pyro_client.sign_in(password=password)
+        peer = await get_channel_peer()
+        stream = AudioPiped(str(fpath), AudioParameters.from_quality("high"))
+        if not vc_active:
+            await calls.join_group_call(CHANNEL, stream, stream_type=stream)
+            vc_active = True
         else:
-            await pyro_client.send_code(PHONE)
-            return {"status": "code_sent"}
-        session_str = await pyro_client.export_session_string()
-        with open(PYRO_SESSION_FILE, "w") as f:
-            f.write(session_str)
-        caller = TgCaller(pyro_client)
-        await caller.start()
-        @caller.on_stream_end
-        async def on_stream_end(client, update):
-            await play_next()
-        return {"status": "success"}
-    except PyroPasswordNeeded:
-        return {"status": "2fa_needed"}
+            await calls.change_stream(CHANNEL, stream)
+        is_playing = True
+    except AlreadyJoinedError:
+        peer = await get_channel_peer()
+        stream = AudioPiped(str(fpath), AudioParameters.from_quality("high"))
+        await calls.change_stream(CHANNEL, stream)
+        is_playing = True
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
+        print(f"[play_next error] {e}")
+        is_playing = False
 
-@app.post("/api/start_vc")
-async def start_vc():
-    try:
-        await start_voice_chat()
-        return {"status": "started"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
+@calls.on_stream_end()
+async def on_end(_, __):
+    global current_index
+    current_index += 1
+    if current_index >= len(queue):
+        current_index = 0          # loop back
+    await play_next()
 
-@app.post("/api/stop_vc")
-async def stop_vc():
-    try:
-        await stop_voice_chat()
-        return {"status": "stopped"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
+# ── WEB AUTH ──────────────────────────────────────────────────────────────────
+security = HTTPBasic()
 
-@app.post("/api/upload")
-async def upload_file(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(('.mp3', '.ogg', '.m4a')):
-        raise HTTPException(400, "Only MP3/OGG/M4A allowed")
-    file_path = UPLOAD_DIR / file.filename
-    with open(file_path, "wb") as f:
-        f.write(await file.read())
-    playlist.append(str(file_path))
-    return {"success": True, "filename": file.filename, "playlist": [p.name for p in playlist]}
+def require_auth(creds: HTTPBasicCredentials = Depends(security)):
+    ok = secrets.compare_digest(creds.password.encode(), WEB_PASS.encode())
+    if not ok:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="Wrong password",
+                            headers={"WWW-Authenticate": "Basic"})
+    return creds.username
 
-@app.post("/api/reorder")
-async def reorder(data: dict):
-    global playlist
-    order = data.get("order", [])
-    full_new = []
-    for fname in order:
-        path = UPLOAD_DIR / fname
-        if path.exists():
-            full_new.append(str(path))
-    playlist = full_new
-    return {"status": "reordered"}
+# ── FASTAPI APP ───────────────────────────────────────────────────────────────
+web = FastAPI(title="TG VC Controller")
+web.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-@app.delete("/api/delete/{filename}")
-async def delete_file(filename: str):
-    global playlist
-    file_path = UPLOAD_DIR / filename
-    if file_path.exists():
-        file_path.unlink()
-    playlist = [p for p in playlist if os.path.basename(p) != filename]
-    return {"status": "deleted"}
-
-@app.post("/api/post_from_source")
-async def post_from_source(message_id: int = Form(...)):
-    client = await get_tele_client()
-    try:
-        msg = await client.get_messages(SOURCE_CHANNEL_ID, ids=message_id)
-        if not msg:
-            raise HTTPException(404, "Message not found")
-        await client.send_message(
-            CHANNEL_ID,
-            message=msg.text,
-            file=msg.media,
-            formatting_entities=msg.entities,
-            link_preview=False
-        )
-        return {"status": "posted"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
-
-@app.post("/api/post_custom")
-async def post_custom(text: str = Form(""), file: UploadFile = File(None)):
-    client = await get_tele_client()
-    try:
-        media = None
-        if file:
-            tmp_path = UPLOAD_DIR / f"temp_{file.filename}"
-            with open(tmp_path, "wb") as f:
-                f.write(await file.read())
-            media = tmp_path
-        await client.send_message(CHANNEL_ID, message=text, file=media)
-        if media:
-            os.remove(media)
-        return {"status": "posted"}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
-
-# ---------- EMBEDDED WEB UI (Full Admin Panel) ----------
-HTML = """
-<!DOCTYPE html>
+# ─── UI ───────────────────────────────────────────────────────────────────────
+HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>VC Admin Panel</title>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>TG VC Controller</title>
 <style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:'Segoe UI',sans-serif;background:#0a0a14;color:#fff;min-height:100vh}
-#particles{position:fixed;top:0;left:0;width:100%;height:100%;z-index:-1}
-.glass{background:rgba(20,20,40,0.7);backdrop-filter:blur(16px);border:1px solid rgba(255,255,255,0.08);border-radius:24px;padding:2rem}
-.login-container,.dashboard{max-width:800px;margin:2rem auto;animation:fadeIn .5s}
-.hidden{display:none}
-input,textarea,button,.file-label{width:100%;padding:12px 16px;margin:8px 0;background:rgba(255,255,255,0.07);border:1px solid rgba(255,255,255,0.1);border-radius:14px;color:#fff;font-size:1rem;transition:.3s}
-button{background:linear-gradient(135deg,#7f00ff,#e100ff);cursor:pointer;font-weight:bold;border:none}
-button:hover{transform:scale(1.02);opacity:0.9}
-.tabs{display:flex;gap:12px;margin-bottom:2rem}
-.tab{padding:12px 24px;border-radius:12px;background:rgba(255,255,255,0.05);cursor:pointer;font-weight:bold;transition:.3s}
-.tab.active{background:linear-gradient(135deg,#7f00ff,#e100ff)}
-.qr-image{width:180px;display:block;margin:1rem auto}
-.playlist-item{display:flex;align-items:center;justify-content:space-between;background:rgba(255,255,255,0.05);padding:12px;margin:6px 0;border-radius:12px}
-.upload-zone{border:2px dashed rgba(255,255,255,0.2);border-radius:20px;padding:2rem;text-align:center;margin:1rem 0;transition:.3s}
-.upload-zone.dragover{border-color:#7f00ff;background:rgba(127,0,255,0.1)}
-.toast{position:fixed;bottom:20px;right:20px;background:#2a2a4a;padding:15px 25px;border-radius:12px;z-index:100;animation:slideUp .3s}
-@keyframes fadeIn{from{opacity:0;transform:translateY(20px)}}
-@keyframes slideUp{from{transform:translateY(80px);opacity:0}}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f0f0f;color:#e8e8e8;min-height:100vh;padding:24px}
+  h1{font-size:20px;font-weight:600;margin-bottom:4px;color:#fff}
+  .sub{font-size:13px;color:#666;margin-bottom:28px}
+  .card{background:#1a1a1a;border:1px solid #2a2a2a;border-radius:12px;padding:20px;margin-bottom:16px}
+  .card h2{font-size:13px;font-weight:500;color:#888;text-transform:uppercase;letter-spacing:.06em;margin-bottom:14px}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  button{padding:9px 18px;border-radius:8px;border:none;font-size:14px;font-weight:500;cursor:pointer;transition:opacity .15s}
+  button:hover{opacity:.82} button:disabled{opacity:.35;cursor:not-allowed}
+  .btn-green{background:#22c55e;color:#000}
+  .btn-red{background:#ef4444;color:#fff}
+  .btn-blue{background:#3b82f6;color:#fff}
+  .btn-gray{background:#2a2a2a;color:#e8e8e8;border:1px solid #3a3a3a}
+  .status-dot{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:7px}
+  .dot-on{background:#22c55e;box-shadow:0 0 6px #22c55e}
+  .dot-off{background:#555}
+  .status-bar{display:flex;align-items:center;font-size:14px;margin-bottom:14px}
+  .queue-list{list-style:none;display:flex;flex-direction:column;gap:6px;max-height:340px;overflow-y:auto}
+  .queue-item{display:flex;align-items:center;gap:10px;background:#222;border:1px solid #2e2e2e;border-radius:8px;padding:9px 12px;font-size:13px}
+  .queue-item.playing{border-color:#3b82f6;background:#1a2540}
+  .q-num{color:#555;font-size:12px;min-width:22px}
+  .q-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .q-del{background:none;border:none;color:#555;font-size:17px;cursor:pointer;padding:0 4px;line-height:1}
+  .q-del:hover{color:#ef4444}
+  input[type=file]{display:none}
+  .upload-label{display:inline-flex;align-items:center;gap:7px;padding:9px 18px;background:#2a2a2a;border:1px solid #3a3a3a;border-radius:8px;font-size:14px;font-weight:500;cursor:pointer;transition:opacity .15s}
+  .upload-label:hover{opacity:.8}
+  .msg{font-size:13px;color:#888;margin-top:10px;min-height:18px}
+  .channel-badge{background:#1e2d3d;color:#60a5fa;font-size:12px;padding:4px 10px;border-radius:6px;font-family:monospace}
+  .progress-bar{height:3px;background:#2a2a2a;border-radius:2px;margin-top:14px}
+  .progress-fill{height:3px;background:#3b82f6;border-radius:2px;transition:width .4s}
+  .skip-btns{display:flex;gap:8px}
+  label.upload-label input{display:none}
 </style>
 </head>
 <body>
-<canvas id="particles"></canvas>
+<h1>📡 TG Voice Chat</h1>
+<p class="sub">Channel: <span class="channel-badge" id="chan">—</span></p>
 
-<div id="loginPage" class="login-container glass">
-  <h2 style="text-align:center;margin-bottom:2rem;">🔐 Admin Login</h2>
-  <input id="username" placeholder="Username">
-  <input type="password" id="password" placeholder="Password">
-  <button onclick="login()">Login</button>
-  <p id="loginError" style="color:#f55;text-align:center;margin-top:12px"></p>
+<div class="card">
+  <h2>Status</h2>
+  <div class="status-bar">
+    <span class="status-dot" id="dot"></span>
+    <span id="status-text">Loading…</span>
+  </div>
+  <div id="now-playing" style="font-size:13px;color:#888;margin-bottom:14px"></div>
+  <div class="row">
+    <button class="btn-green" id="btn-start" onclick="startVC()">▶ Start VC</button>
+    <button class="btn-red"   id="btn-stop"  onclick="stopVC()">■ Stop VC</button>
+    <div class="skip-btns">
+      <button class="btn-gray" onclick="skip(-1)">⏮ Prev</button>
+      <button class="btn-gray" onclick="skip(1)">⏭ Next</button>
+    </div>
+  </div>
+  <div class="progress-bar"><div class="progress-fill" id="pbar" style="width:0%"></div></div>
 </div>
 
-<div id="dashboard" class="dashboard glass hidden">
-  <div class="tabs">
-    <div class="tab active" onclick="switchTab('vc')">🎤 VC Control</div>
-    <div class="tab" onclick="switchTab('sounds')">🎵 Sound Manager</div>
-    <div class="tab" onclick="switchTab('messages')">💬 Message Reposter</div>
-  </div>
+<div class="card">
+  <h2>Queue <span id="q-count" style="color:#555;font-weight:400"></span></h2>
+  <ul class="queue-list" id="q-list"></ul>
+</div>
 
-  <div id="tab-vc">
-    <div style="margin:1.5rem 0;padding:1rem;background:rgba(255,255,255,0.04);border-radius:16px">
-      <p>Telethon Bot: <span id="botStatus">Checking...</span></p>
-      <p>Pyrogram (VC): <span id="pyroStatus">Unknown</span></p>
-      <p>VC: <span id="vcStatus">Stopped</span></p>
-      <p id="currentTrack"></p>
-    </div>
-    <div style="display:flex;gap:1rem">
-      <button onclick="startVC()">▶️ Start VC</button>
-      <button onclick="stopVC()" style="background:linear-gradient(135deg,#ff416c,#ff4b2b)">⏹️ Stop VC</button>
-    </div>
-    <div id="loginSection" class="hidden" style="margin-top:2rem">
-      <h3>Telegram Login (Telethon)</h3>
-      <button onclick="sendCode()">📱 Send Code / QR</button>
-      <div id="qrContainer" class="hidden"><img id="qrImage" class="qr-image"><p>Scan with Telegram</p></div>
-      <div id="codeContainer" class="hidden">
-        <input id="codeInput" placeholder="Enter code">
-        <button onclick="submitCode()">Verify</button>
-      </div>
-      <div id="passwordContainer" class="hidden">
-        <input type="password" id="password2FA" placeholder="2FA Password">
-        <button onclick="submitPassword()">Verify</button>
-      </div>
-    </div>
-    <div id="pyroSection" style="margin-top:2rem">
-      <h3>Pyrogram Voice Login (if needed)</h3>
-      <button onclick="pyroSendCode()">📱 Init Pyrogram</button>
-      <div id="pyroCodeContainer" class="hidden">
-        <input id="pyroCodeInput" placeholder="Enter code">
-        <button onclick="pyroSubmitCode()">Verify Pyrogram</button>
-      </div>
-      <div id="pyroPasswordContainer" class="hidden">
-        <input type="password" id="pyroPassword2FA" placeholder="2FA for Pyrogram">
-        <button onclick="pyroSubmitPassword()">Verify 2FA</button>
-      </div>
-    </div>
-  </div>
-
-  <div id="tab-sounds" class="hidden">
-    <h3>Upload Audio Files</h3>
-    <div class="upload-zone" id="dropZone">
-      <p>Drop MP3/OGG/M4A files here</p>
-      <label for="fileInput" class="file-label" style="display:block;text-align:center;background:#7f00ff;border:none;margin-top:1rem">Browse</label>
-      <input type="file" id="fileInput" multiple accept=".mp3,.ogg,.m4a" style="display:none">
-    </div>
-    <div id="playlistContainer"></div>
-  </div>
-
-  <div id="tab-messages" class="hidden">
-    <h3>Repost from Source Channel</h3>
-    <input type="number" id="sourceMsgId" placeholder="Source message ID">
-    <button onclick="postFromSource()">📨 Repost to VC Channel</button>
-    <hr style="margin:2rem 0;border-color:rgba(255,255,255,0.1)">
-    <h3>Send Custom Message</h3>
-    <textarea id="customText" placeholder="Your message..." rows="3"></textarea>
-    <input type="file" id="customFile" accept="*">
-    <button onclick="postCustom()">✉️ Send to VC Channel</button>
+<div class="card">
+  <h2>Upload Voice</h2>
+  <div class="row">
+    <label class="upload-label">
+      📂 Choose Files
+      <input type="file" id="file-input" accept="audio/*" multiple onchange="uploadFiles()"/>
+    </label>
+    <span id="upload-msg" class="msg"></span>
   </div>
 </div>
 
 <script>
-// Particles effect
-const canvas=document.getElementById('particles');
-const ctx=canvas.getContext('2d');
-canvas.width=innerWidth;canvas.height=innerHeight;
-let particles=[];
-class Particle{constructor(){this.reset()}reset(){this.x=Math.random()*canvas.width;this.y=Math.random()*canvas.height;this.size=Math.random()*2+1;this.speedX=(Math.random()-0.5)*0.5;this.speedY=(Math.random()-0.5)*0.5;this.opacity=Math.random()*0.5+0.2}update(){this.x+=this.speedX;this.y+=this.speedY;if(this.x<0||this.x>canvas.width||this.y<0||this.y>canvas.height)this.reset()}draw(){ctx.beginPath();ctx.arc(this.x,this.y,this.size,0,Math.PI*2);ctx.fillStyle=`rgba(127,0,255,${this.opacity})`;ctx.fill()}}
-for(let i=0;i<80;i++)particles.push(new Particle());
-function anim(){ctx.clearRect(0,0,canvas.width,canvas.height);particles.forEach(p=>{p.update();p.draw()});requestAnimationFrame(anim)}anim();
-addEventListener('resize',()=>{canvas.width=innerWidth;canvas.height=innerHeight});
+const api = '';
+let state = {};
 
-function toast(msg){let t=document.createElement('div');t.className='toast';t.textContent=msg;document.body.appendChild(t);setTimeout(()=>t.remove(),3000)}
-
-function switchTab(tab){
-  ['vc','sounds','messages'].forEach(t=>document.getElementById('tab-'+t).classList.add('hidden'));
-  document.getElementById('tab-'+tab).classList.remove('hidden');
-  document.querySelectorAll('.tab').forEach((el,i)=>{el.classList.toggle('active', i===['vc','sounds','messages'].indexOf(tab))});
+function b64(p){return btoa('user:'+p)}
+function getPass(){
+  let p=sessionStorage.getItem('vc_pass');
+  if(!p){p=prompt('Password:');sessionStorage.setItem('vc_pass',p);}
+  return p;
 }
 
-async function login(){
-  let u=document.getElementById('username').value,p=document.getElementById('password').value;
-  let r=await fetch('/api/login',{method:'POST',body:new URLSearchParams({username:u,password:p})});
-  if(r.ok){localStorage.setItem('logged','1');document.getElementById('loginPage').classList.add('hidden');document.getElementById('dashboard').classList.remove('hidden');loadStatus();setInterval(loadStatus,5000)}
-  else document.getElementById('loginError').textContent='Invalid credentials';
+async function req(path,opts={}){
+  const pass=getPass();
+  const headers={'Authorization':'Basic '+b64(pass),...(opts.headers||{})};
+  const r=await fetch(api+path,{...opts,headers});
+  if(r.status===401){sessionStorage.removeItem('vc_pass');location.reload();}
+  return r;
 }
 
-async function loadStatus(){
-  let r=await fetch('/api/status'),d=await r.json();
-  document.getElementById('botStatus').textContent=d.authorized?'Connected ✅':'Disconnected ❌';
-  document.getElementById('pyroStatus').textContent=d.pyro_authorized?'Ready ✅':'Not logged in';
-  document.getElementById('vcStatus').textContent=d.vc_active?'Playing 🔊':'Stopped';
-  document.getElementById('currentTrack').textContent=d.current_track?'Now: '+d.current_track:'';
-  if(!d.authorized)document.getElementById('loginSection').classList.remove('hidden');
-  else document.getElementById('loginSection').classList.add('hidden');
-  renderPlaylist(d.playlist);
+async function fetchState(){
+  try{
+    const r=await req('/state');
+    state=await r.json();
+    render();
+  }catch(e){}
 }
-function renderPlaylist(list){
-  let c=document.getElementById('playlistContainer');
-  c.innerHTML=list.map((n,i)=>`<div class="playlist-item"><span>🎵 ${n}</span><div><button onclick="delFile('${n}')">🗑️</button></div></div>`).join('');
-}
-async function delFile(name){await fetch('/api/delete/'+name,{method:'DELETE'});loadStatus()}
 
-async function sendCode(){
-  let r=await fetch('/api/send_code',{method:'POST'}),d=await r.json();
-  if(d.status=='code_sent'){document.getElementById('codeContainer').classList.remove('hidden')}
-  else if(d.qr_image){document.getElementById('qrImage').src=d.qr_image;document.getElementById('qrContainer').classList.remove('hidden')}
+function render(){
+  document.getElementById('chan').textContent=state.channel||'—';
+  const on=state.vc_active;
+  document.getElementById('dot').className='status-dot '+(on?'dot-on':'dot-off');
+  document.getElementById('status-text').textContent=on?(state.is_playing?'Playing':'Connected, idle'):'Disconnected';
+  document.getElementById('btn-start').disabled=on;
+  document.getElementById('btn-stop').disabled=!on;
+
+  const np=state.current_file||'';
+  document.getElementById('now-playing').textContent=np?'▶ '+np:'';
+
+  const pct=state.queue_length>0?((state.current_index+1)/state.queue_length*100):0;
+  document.getElementById('pbar').style.width=Math.min(pct,100)+'%';
+
+  const q=state.queue||[];
+  document.getElementById('q-count').textContent='('+q.length+'/'+state.max_voices+')';
+  const ul=document.getElementById('q-list');
+  ul.innerHTML='';
+  q.forEach((f,i)=>{
+    const li=document.createElement('li');
+    li.className='queue-item'+(i===state.current_index&&state.is_playing?' playing':'');
+    li.innerHTML=`<span class="q-num">${i+1}</span><span class="q-name">${f}</span><button class="q-del" onclick="removeTrack('${encodeURIComponent(f)}')" title="Remove">✕</button>`;
+    ul.appendChild(li);
+  });
 }
-async function submitCode(){
-  let code=document.getElementById('codeInput').value;
-  let r=await fetch('/api/submit_code',{method:'POST',body:new URLSearchParams({code})});
-  let d=await r.json();
-  if(d.status=='2fa_needed')document.getElementById('passwordContainer').classList.remove('hidden');
-  else if(r.ok){toast('Logged in');loadStatus()}
-}
-async function submitPassword(){
-  let p=document.getElementById('password2FA').value;
-  let r=await fetch('/api/submit_password',{method:'POST',body:new URLSearchParams({password:p})});
-  if(r.ok){toast('2FA verified');loadStatus()}
-}
+
 async function startVC(){
-  let r=await fetch('/api/start_vc',{method:'POST'});
-  if(r.ok)toast('VC started');else{let e=await r.json();toast('Error: '+e.error)}
-  loadStatus();
+  await req('/start',{method:'POST'});
+  setTimeout(fetchState,800);
 }
 async function stopVC(){
-  let r=await fetch('/api/stop_vc',{method:'POST'});
-  if(r.ok)toast('VC stopped');
-  loadStatus();
+  await req('/stop',{method:'POST'});
+  setTimeout(fetchState,800);
 }
-// Pyrogram login steps
-async function pyroSendCode(){
-  let r=await fetch('/api/pyro_login',{method:'POST'});
-  let d=await r.json();
-  if(d.status=='code_sent') document.getElementById('pyroCodeContainer').classList.remove('hidden');
-  else toast('Error: '+d.error);
+async function skip(dir){
+  await req('/skip?dir='+dir,{method:'POST'});
+  setTimeout(fetchState,600);
 }
-async function pyroSubmitCode(){
-  let code=document.getElementById('pyroCodeInput').value;
-  let r=await fetch('/api/pyro_login',{method:'POST',body:new URLSearchParams({code})});
-  let d=await r.json();
-  if(d.status=='2fa_needed') document.getElementById('pyroPasswordContainer').classList.remove('hidden');
-  else if(r.ok){toast('Pyrogram ready');loadStatus();}
-}
-async function pyroSubmitPassword(){
-  let p=document.getElementById('pyroPassword2FA').value;
-  let r=await fetch('/api/pyro_login',{method:'POST',body:new URLSearchParams({password:p})});
-  if(r.ok){toast('Pyrogram ready');loadStatus();}
-}
-// Uploads
-let dz=document.getElementById('dropZone');
-dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('dragover')});
-dz.addEventListener('dragleave',()=>dz.classList.remove('dragover'));
-dz.addEventListener('drop',async e=>{e.preventDefault();dz.classList.remove('dragover');for(let f of e.dataTransfer.files)await upload(f)});
-document.getElementById('fileInput').addEventListener('change',async e=>{for(let f of e.target.files)await upload(f)});
-async function upload(file){
-  let fd=new FormData();fd.append('file',file);
-  let r=await fetch('/api/upload',{method:'POST',body:fd});
-  if(r.ok){toast('Uploaded: '+file.name);loadStatus()}else toast('Upload failed');
-}
-// Message reposting
-async function postFromSource(){
-  let id=document.getElementById('sourceMsgId').value;
-  let r=await fetch('/api/post_from_source',{method:'POST',body:new URLSearchParams({message_id:id})});
-  if(r.ok)toast('Message reposted!');else{let e=await r.json();toast('Error: '+e.error)}
-}
-async function postCustom(){
-  let text=document.getElementById('customText').value;
-  let file=document.getElementById('customFile').files[0];
-  let fd=new FormData();fd.append('text',text);if(file)fd.append('file',file);
-  let r=await fetch('/api/post_custom',{method:'POST',body:fd});
-  if(r.ok)toast('Message sent!');else{let e=await r.json();toast('Error: '+e.error)}
+async function removeTrack(name){
+  await req('/queue/'+name,{method:'DELETE'});
+  fetchState();
 }
 
-window.onload=()=>{if(localStorage.getItem('logged')){document.getElementById('loginPage').classList.add('hidden');document.getElementById('dashboard').classList.remove('hidden');loadStatus();setInterval(loadStatus,5000)}}
+async function uploadFiles(){
+  const input=document.getElementById('file-input');
+  const msg=document.getElementById('upload-msg');
+  if(!input.files.length)return;
+  msg.textContent='Uploading…';
+  let ok=0,fail=0;
+  for(const f of input.files){
+    const fd=new FormData();
+    fd.append('file',f);
+    const r=await req('/upload',{method:'POST',body:fd});
+    if(r.ok)ok++;else fail++;
+  }
+  msg.textContent=`✓ ${ok} uploaded${fail?' · '+fail+' failed':''}`;
+  input.value='';
+  fetchState();
+  setTimeout(()=>{msg.textContent=''},4000);
+}
+
+fetchState();
+setInterval(fetchState,3000);
 </script>
 </body>
-</html>
-"""
+</html>"""
 
-@app.get("/", response_class=HTMLResponse)
-async def root():
-    return HTML
+@web.get("/", response_class=HTMLResponse)
+async def ui():
+    return HTML_PAGE
 
-# ---------- STARTUP ----------
-@app.on_event("startup")
-async def startup():
-    await get_tele_client()
-    if await tele_client.is_user_authorized():
-        login_state["status"] = "logged_in"
-        await init_pyrogram_and_caller()
+@web.get("/state")
+async def get_state(_=Depends(require_auth)):
+    cur = queue[current_index] if queue and current_index < len(queue) else None
+    return {
+        "vc_active": vc_active,
+        "is_playing": is_playing,
+        "channel": CHANNEL,
+        "queue": queue,
+        "queue_length": len(queue),
+        "current_index": current_index,
+        "current_file": cur,
+        "max_voices": MAX_VOICES,
+    }
 
-def run():
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+@web.post("/start")
+async def start_vc(_=Depends(require_auth)):
+    global vc_active
+    if vc_active:
+        return {"ok": True, "msg": "already active"}
+    try:
+        if queue:
+            await play_next()
+        else:
+            # join silently with no stream
+            peer = await get_channel_peer()
+            await calls.join_group_call(CHANNEL,
+                AudioPiped("", AudioParameters.from_quality("high")),
+            )
+            vc_active = True
+    except NoActiveGroupCall:
+        raise HTTPException(400, "No active voice chat in channel. Start one from Telegram first.")
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    return {"ok": True}
+
+@web.post("/stop")
+async def stop_vc(_=Depends(require_auth)):
+    global vc_active, is_playing
+    try:
+        await calls.leave_group_call(CHANNEL)
+    except Exception:
+        pass
+    vc_active = False
+    is_playing = False
+    return {"ok": True}
+
+@web.post("/skip")
+async def skip_track(dir: int = 1, _=Depends(require_auth)):
+    global current_index
+    current_index = max(0, current_index + dir)
+    if current_index >= len(queue):
+        current_index = 0
+    if vc_active:
+        await play_next()
+    return {"ok": True, "index": current_index}
+
+@web.post("/upload")
+async def upload_voice(file: UploadFile = File(...), _=Depends(require_auth)):
+    if len(queue) >= MAX_VOICES:
+        raise HTTPException(400, f"Queue full ({MAX_VOICES} max). Remove tracks first.")
+    ext = Path(file.filename).suffix.lower()
+    if ext not in {".mp3", ".ogg", ".wav", ".flac", ".m4a", ".opus"}:
+        raise HTTPException(400, "Unsupported format. Use mp3/ogg/wav/flac/m4a/opus.")
+    # safe filename
+    safe = "".join(c for c in file.filename if c.isalnum() or c in "._- ").strip()
+    dest = AUDIO_DIR / safe
+    with open(dest, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+    if safe not in queue:
+        queue.append(safe)
+    return {"ok": True, "file": safe, "queue_length": len(queue)}
+
+@web.delete("/queue/{filename}")
+async def remove_from_queue(filename: str, _=Depends(require_auth)):
+    global current_index
+    fname = filename  # already decoded by FastAPI
+    if fname in queue:
+        idx = queue.index(fname)
+        queue.remove(fname)
+        try:
+            (AUDIO_DIR / fname).unlink(missing_ok=True)
+        except Exception:
+            pass
+        if current_index >= idx and current_index > 0:
+            current_index -= 1
+    return {"ok": True, "queue": queue}
+
+# ── ENTRYPOINT ────────────────────────────────────────────────────────────────
+async def main():
+    print(f"[TG-VC] Starting userbot…")
+    await app_client.start()
+    await calls.start()
+    print(f"[TG-VC] Userbot ready. Channel: {CHANNEL}")
+    print(f"[TG-VC] Web dashboard → http://0.0.0.0:{WEB_PORT}")
+    config = uvicorn.Config(web, host="0.0.0.0", port=WEB_PORT, log_level="warning")
+    server = uvicorn.Server(config)
+    await server.serve()
 
 if __name__ == "__main__":
-    run()
+    asyncio.run(main())
